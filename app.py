@@ -5,75 +5,55 @@ import openai
 import streamlit as st
 from sklearn.ensemble import RandomForestRegressor
 
-# Predict missing distances
 def predict_and_fill_distances(df):
     df["comment_length"] = df["comments"].apply(len)
     df["price_bin"] = pd.qcut(df["price"], q=4, labels=False, duplicates="drop")
     df["comment_length_bin"] = pd.qcut(df["comment_length"], q=4, labels=False, duplicates="drop")
+    features = ["price", "price_bin", "comment_length", "comment_length_bin"]
+    X = df[features].fillna(df[features].mean())
 
-    feature_cols = ["price", "price_bin", "comment_length", "comment_length_bin"]
-    X = df[feature_cols].fillna(df[feature_cols].mean())
-
-    if df["distance_from_beach"].notna().sum() > 5:
+    if df["distance_from_beach"].notna().sum() >= 1:
         model_beach = RandomForestRegressor()
         model_beach.fit(X[df["distance_from_beach"].notna()], df.loc[df["distance_from_beach"].notna(), "distance_from_beach"])
         df.loc[df["distance_from_beach"].isna(), "distance_from_beach"] = model_beach.predict(X[df["distance_from_beach"].isna()])
 
-    if df["distance_from_city_center"].notna().sum() > 5:
+    if df["distance_from_city_center"].notna().sum() >= 1:
         model_city = RandomForestRegressor()
         model_city.fit(X[df["distance_from_city_center"].notna()], df.loc[df["distance_from_city_center"].notna(), "distance_from_city_center"])
         df.loc[df["distance_from_city_center"].isna(), "distance_from_city_center"] = model_city.predict(X[df["distance_from_city_center"].isna()])
 
     return df
 
-# Load data
-def load_and_clean_data(file_path):
-    df = pd.read_excel(file_path, sheet_name="Reviews")
+def load_and_clean_data(path):
+    df = pd.read_excel(path, sheet_name="Reviews")
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["comments"] = df["comments"].fillna("No review")
-
     if "distance_from_beach" not in df.columns:
         df["distance_from_beach"] = np.nan
     if "distance_from_city_center" not in df.columns:
         df["distance_from_city_center"] = np.nan
+    return predict_and_fill_distances(df)
 
-    df = predict_and_fill_distances(df)
-    return df
-
-# Optional GPT interpretation
-def get_ai_query_intent(prompt):
-    try:
-        openai.api_key = os.getenv("OPENAI_API_KEY")
-        if not openai.api_key:
-            return None
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You help users find Airbnb listings."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response["choices"][0]["message"]["content"]
-    except Exception:
-        return None
-
-# Simple fallback logic
 def local_interpret_query(query):
     query = query.lower()
     price_limit = 100
     near_beach = "beach" in query
-    if "under" in query:
-        try:
-            price_limit = int(query.split("under")[1].split()[0].replace("$", "").strip())
-        except:
-            pass
+    if "under" in query or "max" in query:
+        for keyword in ["under", "max", "less than"]:
+            if keyword in query:
+                try:
+                    price_limit = int(query.split(keyword)[1].split()[0].replace("$", "").strip())
+                    break
+                except:
+                    pass
     return price_limit, near_beach
 
-# Format distances
-def format_distance(value):
-    return f"{value:.1f} km" if pd.notna(value) else "unknown"
+def format_km(val):
+    try:
+        return f"{float(val):.1f} km"
+    except:
+        return "Not specified"
 
-# Main chatbot logic
 def run_chatbot():
     st.set_page_config(page_title="Airbnb Chatbot", layout="centered")
     st.title("Airbnb Chatbot – Explore Listings in Messina")
@@ -82,32 +62,73 @@ def run_chatbot():
         st.session_state.history = []
 
     df = load_and_clean_data("Airbnb_EDA_Messina.xlsx")
-    user_input = st.chat_input("Ask something like 'places near the beach under $100'")
+    user_input = st.chat_input("Ask something like 'family-friendly listings near the beach under $80'")
 
     if user_input:
         st.session_state.history.append({"user": user_input})
-        gpt_response = get_ai_query_intent(user_input)
+        price_limit, near_beach = local_interpret_query(user_input)
 
-        if gpt_response:
-            bot_reply = f"""GPT response:
+        # Filtraggio iniziale
+        filtered = df[df["price"] <= price_limit]
+        if near_beach:
+            filtered = filtered.sort_values(by="distance_from_beach")
 
-{gpt_response}"""
+        # Rimuovi duplicati per nome, prendi solo uno per ciascun nome
+        filtered = filtered.drop_duplicates(subset="name", keep="first")
+
+        if filtered.empty:
+            # fallback: suggerisci il migliore anche se sopra budget
+            fallback = df.sort_values(by="distance_from_beach" if near_beach else "price")
+            fallback = fallback.drop_duplicates(subset="name", keep="first").head(1)
+            fallback_notice = True
+            results = fallback
         else:
-            price_limit, near_beach = local_interpret_query(user_input)
-            results = df[df["price"] <= price_limit]
+            fallback_notice = False
+            results = filtered.head(3)
 
-            if near_beach:
-                results = results.sort_values(by="distance_from_beach").head(5)
-            else:
-                results = results.head(5)
+        listings_text = ""
+        for _, row in results.iterrows():
+            listings_text += f"- Name: {row['name']}\n"
+            listings_text += f"  Price: ${row['price']:.0f} per night\n"
+            listings_text += f"  Beach Distance: {format_km(row['distance_from_beach'])}\n"
+            listings_text += f"  Center Distance: {format_km(row['distance_from_city_center'])}\n"
+            listings_text += f"  Summary of Guest Comment: \"{row['comments'][:180]}\"\n\n"
 
-            if results.empty:
-                bot_reply = "No listings match your criteria."
-            else:
-                bot_reply = "Here are some listings:\n\n"
-                for _, row in results.iterrows():
-                    bot_reply += f"- ${row['price']} | Beach: {format_distance(row['distance_from_beach'])}, Center: {format_distance(row['distance_from_city_center'])}\n"
-                    bot_reply += f"  Review: \"{row['comments'][:100]}...\"\n\n"
+        prompt = f"""
+You are an assistant helping users discover Airbnb listings in Messina.
+
+User query:
+{user_input}
+
+Here are the listings:
+
+{listings_text}
+
+Please recommend the best listing(s). Mention the name, price, distances, and comment summary.
+Conclude by reminding the user to check Airbnb for live availability and pricing.
+"""
+
+        try:
+            openai.api_key = os.getenv("OPENAI_API_KEY")
+            if not openai.api_key:
+                raise ValueError("Missing OpenAI API key.")
+
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You help users choose the best Airbnb listings in Messina."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            bot_reply = response["choices"][0]["message"]["content"]
+
+        except Exception as e:
+            bot_reply = f"Sorry, GPT could not process your request.\n\nError: {e}"
+
+        if fallback_notice:
+            bot_reply = (
+                f"⚠️ No listings were found under ${price_limit}, but here's the closest match:\n\n{bot_reply}"
+            )
 
         st.session_state.history[-1]["bot"] = bot_reply
 
@@ -116,6 +137,5 @@ def run_chatbot():
         if "bot" in chat:
             st.chat_message("assistant").write(chat["bot"])
 
-# Run app
 if __name__ == "__main__":
     run_chatbot()
