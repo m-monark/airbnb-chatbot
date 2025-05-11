@@ -1,9 +1,11 @@
 import pandas as pd
 import numpy as np
 import os
-import openai
 import streamlit as st
 from sklearn.ensemble import RandomForestRegressor
+from openai import OpenAI
+
+# Predict missing distances using RandomForest
 
 def predict_and_fill_distances(df):
     df["comment_length"] = df["comments"].apply(len)
@@ -24,6 +26,8 @@ def predict_and_fill_distances(df):
 
     return df
 
+# Load and clean data
+
 def load_and_clean_data(path):
     df = pd.read_excel(path, sheet_name="Reviews")
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
@@ -34,25 +38,30 @@ def load_and_clean_data(path):
         df["distance_from_city_center"] = np.nan
     return predict_and_fill_distances(df)
 
+# Interpret query for price and beach condition
+
 def local_interpret_query(query):
     query = query.lower()
     price_limit = 100
     near_beach = "beach" in query
-    if "under" in query or "max" in query:
-        for keyword in ["under", "max", "less than"]:
-            if keyword in query:
-                try:
-                    price_limit = int(query.split(keyword)[1].split()[0].replace("$", "").strip())
-                    break
-                except:
-                    pass
+    for keyword in ["under", "max", "less than"]:
+        if keyword in query:
+            try:
+                price_limit = int(query.split(keyword)[1].split()[0].replace("$", "").strip())
+                break
+            except:
+                pass
     return price_limit, near_beach
+
+# Format distances
 
 def format_km(val):
     try:
         return f"{float(val):.1f} km"
     except:
         return "Not specified"
+
+# Run the app
 
 def run_chatbot():
     st.set_page_config(page_title="Airbnb Chatbot", layout="centered")
@@ -68,16 +77,12 @@ def run_chatbot():
         st.session_state.history.append({"user": user_input})
         price_limit, near_beach = local_interpret_query(user_input)
 
-        # Filtraggio iniziale
         filtered = df[df["price"] <= price_limit]
         if near_beach:
             filtered = filtered.sort_values(by="distance_from_beach")
-
-        # Rimuovi duplicati per nome, prendi solo uno per ciascun nome
         filtered = filtered.drop_duplicates(subset="name", keep="first")
 
         if filtered.empty:
-            # fallback: suggerisci il migliore anche se sopra budget
             fallback = df.sort_values(by="distance_from_beach" if near_beach else "price")
             fallback = fallback.drop_duplicates(subset="name", keep="first").head(1)
             fallback_notice = True
@@ -109,26 +114,20 @@ Conclude by reminding the user to check Airbnb for live availability and pricing
 """
 
         try:
-            openai.api_key = os.getenv("OPENAI_API_KEY")
-            if not openai.api_key:
-                raise ValueError("Missing OpenAI API key.")
-
-            response = openai.ChatCompletion.create(
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": "You help users choose the best Airbnb listings in Messina."},
                     {"role": "user", "content": prompt}
                 ]
             )
-            bot_reply = response["choices"][0]["message"]["content"]
-
+            bot_reply = response.choices[0].message.content
         except Exception as e:
             bot_reply = f"Sorry, GPT could not process your request.\n\nError: {e}"
 
         if fallback_notice:
-            bot_reply = (
-                f"⚠️ No listings were found under ${price_limit}, but here's the closest match:\n\n{bot_reply}"
-            )
+            bot_reply = f"\ud83d\udea8 No listings were found under ${price_limit}, but here's the closest match:\n\n{bot_reply}"
 
         st.session_state.history[-1]["bot"] = bot_reply
 
